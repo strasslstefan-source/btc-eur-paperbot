@@ -1,342 +1,280 @@
 
 import json
-import sqlite3
+import os
 import time
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
 import requests
+from database import initialize, connect
 
-BASE = "https://api.kraken.com/0/public/OHLC"
-DB = Path("paperbot.sqlite3")
-CONFIG = json.loads(Path("config.json").read_text())
-START_CAPITAL = float(CONFIG["initial_capital_eur"])
-FEE = float(CONFIG["fee_rate"])
-SLIPPAGE = float(CONFIG["slippage_rate"])
-MAX_ENTRY = float(CONFIG["max_entry_eur"])
-MAX_ENTRIES = int(CONFIG["max_entries"])
-STOP = float(CONFIG["stop_loss_pct"])
-TARGET = float(CONFIG["take_profit_pct"])
-COOLDOWN = int(CONFIG["cooldown_minutes"])
-PAIR = CONFIG.get("symbol", "XBTEUR")
-
-db = sqlite3.connect(DB, check_same_thread=False)
-db.execute("""
-CREATE TABLE IF NOT EXISTS events (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- time TEXT, event TEXT, details TEXT
-)""")
-db.execute("""
-CREATE TABLE IF NOT EXISTS equity (
- time TEXT, cash REAL, equity REAL, pnl REAL, signal TEXT
-)""")
-db.execute("""
-CREATE TABLE IF NOT EXISTS trades (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- side TEXT, entry_time TEXT, exit_time TEXT,
- entry_price REAL, exit_price REAL, quantity REAL,
- pnl REAL, costs REAL, reason TEXT
-)""")
-db.commit()
-
-cash = START_CAPITAL
-position = None
-entries = 0
-last_exit = None
-last_5m = None
-last_hour = None
-start_time = datetime.now(timezone.utc)
-end_time = start_time + timedelta(hours=24)
-halted = False
-
+API = "https://api.kraken.com/0/public/OHLC"
+CFG = json.load(open("config.json"))
+PAIR = CFG["symbol"]
+START_CAPITAL = float(CFG["initial_capital_eur"])
+FEE = float(CFG["fee_rate"])
+SLIP = float(CFG["slippage_rate"])
+MAX_ENTRY = float(CFG["max_entry_eur"])
+MAX_ENTRIES = int(CFG["max_entries"])
+STOP = float(CFG["stop_loss_pct"])
+TARGET = float(CFG["take_profit_pct"])
+COOLDOWN = int(CFG["cooldown_minutes"])
 
 def log(event, details):
-    now = datetime.now(timezone.utc).isoformat()
-    db.execute("INSERT INTO events(time,event,details) VALUES(?,?,?)",
-               (now, event, str(details)))
-    db.commit()
-    print(now, event, details, flush=True)
-
+    with connect() as db:
+        db.execute(
+            "INSERT INTO events(event,details) VALUES(%s,%s)",
+            (event, json.dumps(details))
+        )
 
 def candles(interval):
-    response = requests.get(
-        BASE,
+    r = requests.get(
+        API,
         params={"pair": PAIR, "interval": interval},
         timeout=20
     )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("error"):
+    r.raise_for_status()
+    data = r.json()
+    if data["error"]:
         raise RuntimeError(str(data["error"]))
-    result = data["result"]
-    key = next(k for k in result if k != "last")
-    rows = result[key]
+    rows = next(v for k, v in data["result"].items() if k != "last")
     now = time.time()
-    duration = interval * 60
-    complete = [
+    return [
         {
-            "time": int(float(r[0])),
-            "open": float(r[1]),
-            "high": float(r[2]),
-            "low": float(r[3]),
-            "close": float(r[4])
+            "time": int(float(x[0])),
+            "open": float(x[1]),
+            "high": float(x[2]),
+            "low": float(x[3]),
+            "close": float(x[4])
         }
-        for r in rows
-        if float(r[0]) + duration <= now
+        for x in rows
+        if float(x[0]) + interval * 60 <= now
     ]
-    return complete
-
 
 def ema(values, period):
-    if len(values) < period:
-        raise ValueError("Zu wenige EMA-Daten")
+    result = [None] * (period - 1)
     value = sum(values[:period]) / period
-    result = [None] * (period - 1) + [value]
+    result.append(value)
     alpha = 2 / (period + 1)
-    for price in values[period:]:
-        value = price * alpha + value * (1 - alpha)
+    for x in values[period:]:
+        value = alpha * x + (1 - alpha) * value
         result.append(value)
     return result
 
-
-def rsi_wilder(values, period=14):
-    if len(values) < period + 1:
-        raise ValueError("Zu wenige RSI-Daten")
-    changes = [values[i] - values[i - 1]
-               for i in range(1, len(values))]
+def rsi(values, period=14):
+    changes = [values[i] - values[i-1] for i in range(1, len(values))]
     gains = [max(x, 0) for x in changes]
     losses = [max(-x, 0) for x in changes]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    result = [None] * period
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
 
-    def value(g, l):
+    def calc(g, l):
         if l == 0:
-            return 100.0 if g > 0 else 50.0
+            return 100.0 if g else 50.0
         return 100 - 100 / (1 + g / l)
 
-    result.append(value(avg_gain, avg_loss))
+    result = [None] * period + [calc(ag, al)]
     for i in range(period, len(changes)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        result.append(value(avg_gain, avg_loss))
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+        result.append(calc(ag, al))
     return result
 
-
-def get_signal(rows):
+def signal(rows):
     if len(rows) < 100:
-        raise RuntimeError("Weniger als 100 abgeschlossene Stundenkerzen")
-    closes = [r["close"] for r in rows]
-    e12 = ema(closes, 12)
-    e26 = ema(closes, 26)
-    rsi = rsi_wilder(closes, 14)
-
-    if any(x is None for x in (e12[-1], e12[-2], e26[-1],
-                               e26[-2], rsi[-1])):
-        return "NEUTRAL"
-
-    if (e12[-1] > e26[-1] and e12[-1] > e12[-2]
-            and e26[-1] > e26[-2] and 50 <= rsi[-1] <= 68):
+        raise RuntimeError("Zu wenige Stundenkerzen")
+    closes = [x["close"] for x in rows]
+    a = ema(closes, 12)
+    b = ema(closes, 26)
+    r = rsi(closes)
+    if a[-1] > b[-1] and a[-1] > a[-2] and b[-1] > b[-2] and 50 <= r[-1] <= 68:
         return "LONG"
-
-    if (e12[-1] < e26[-1] and e12[-1] < e12[-2]
-            and e26[-1] < e26[-2] and 32 <= rsi[-1] <= 50):
+    if a[-1] < b[-1] and a[-1] < a[-2] and b[-1] < b[-2] and 32 <= r[-1] <= 50:
         return "SHORT"
-
     return "NEUTRAL"
 
+def load_state():
+    with connect() as db:
+        state = db.execute(
+            "SELECT * FROM bot_state WHERE id=1"
+        ).fetchone()
+        if state:
+            return state
+        now = datetime.now(timezone.utc)
+        db.execute("""
+            INSERT INTO bot_state
+            (id,cash,entries,position,test_start,test_end,halted)
+            VALUES(1,%s,0,NULL,%s,%s,FALSE)
+        """, (START_CAPITAL, now, now + timedelta(hours=24)))
+        return db.execute(
+            "SELECT * FROM bot_state WHERE id=1"
+        ).fetchone()
 
-def equity_value(mark):
-    if position is None:
-        return cash
-    p = position
-    if p["side"] == "LONG":
-        exit_price = mark * (1 - SLIPPAGE)
-        gross = (exit_price - p["entry"]) * p["qty"]
-    else:
-        exit_price = mark * (1 + SLIPPAGE)
-        gross = (p["entry"] - exit_price) * p["qty"]
-    exit_fee = exit_price * p["qty"] * FEE
-    return cash + gross - exit_fee
-
-
-def close_position(price, reason, stamp):
-    global position, cash, last_exit
-    p = position
-    if p is None:
-        return
-    if p["side"] == "LONG":
-        fill = price * (1 - SLIPPAGE)
-        gross = (fill - p["entry"]) * p["qty"]
-    else:
-        fill = price * (1 + SLIPPAGE)
-        gross = (p["entry"] - fill) * p["qty"]
-
-    exit_fee = fill * p["qty"] * FEE
-    cash += gross - exit_fee
-    total_costs = p["entry_fee"] + exit_fee
-    net = gross - total_costs
-
-    db.execute("""
-    INSERT INTO trades(side,entry_time,exit_time,entry_price,
-    exit_price,quantity,pnl,costs,reason)
-    VALUES(?,?,?,?,?,?,?,?,?)
-    """, (p["side"], p["time"], stamp, p["entry"], fill,
-          p["qty"], net, total_costs, reason))
-    db.commit()
-    log("POSITION_CLOSED", {
-        "side": p["side"], "reason": reason,
-        "net_pnl_eur": round(net, 4), "cash": round(cash, 4)
-    })
-    position = None
-    last_exit = datetime.now(timezone.utc)
-
-
-def open_position(side, price, stamp):
-    global position, cash, entries
-    if entries >= MAX_ENTRIES or position is not None:
-        return
-    if cash <= 0:
-        return
-    notional = min(MAX_ENTRY, cash)
-    fill = price * (1 + SLIPPAGE if side == "LONG" else 1 - SLIPPAGE)
-    qty = notional / fill
-    fee = notional * FEE
-    cash -= fee
-    position = {
-        "side": side, "entry": fill, "qty": qty,
-        "entry_fee": fee, "time": stamp
-    }
-    entries += 1
-    log("POSITION_OPENED", {
-        "side": side, "entry": fill, "quantity": qty,
-        "notional": notional, "fee": fee, "entry_count": entries
-    })
-
-
-def process_candle(candle, signal):
-    global halted
-    stamp = datetime.fromtimestamp(
-        candle["time"], timezone.utc
-    ).isoformat()
-    op = candle["open"]
-
-    if position:
-        p = position
-        if p["side"] == "LONG":
-            stop_price = p["entry"] * (1 - STOP)
-            target_price = p["entry"] * (1 + TARGET)
-            hit_stop = candle["low"] <= stop_price
-            hit_target = candle["high"] >= target_price
-        else:
-            stop_price = p["entry"] * (1 + STOP)
-            target_price = p["entry"] * (1 - TARGET)
-            hit_stop = candle["high"] >= stop_price
-            hit_target = candle["low"] <= target_price
-
-        # Bei Berührung beider Grenzen in derselben Kerze
-        # wird vorsichtshalber der Stop-Loss angenommen.
-        if hit_stop:
-            close_position(stop_price, "STOP_LOSS", stamp)
-        elif hit_target:
-            close_position(target_price, "TAKE_PROFIT", stamp)
-
-    if position and signal in ("NEUTRAL", "LONG", "SHORT"):
-        if signal != position["side"]:
-            close_position(op, "SIGNAL_CHANGE", stamp)
-            return
-
-    if position is None and not halted:
-        if cash <= 0:
-            return
-        if equity_value(candle["close"]) <= START_CAPITAL - 3:
-            halted = True
-            log("RISK_STOP", "Keine neuen Trades; Position wird geschlossen")
-            return
-        if last_exit is not None:
-            if datetime.now(timezone.utc) - last_exit < timedelta(minutes=COOLDOWN):
-                return
-        if signal in ("LONG", "SHORT") and entries < MAX_ENTRIES:
-            open_position(signal, op, stamp)
-
+def save_state(cash, entries, position, last_exit, halted):
+    with connect() as db:
+        db.execute("""
+            UPDATE bot_state
+            SET cash=%s, entries=%s, position=%s,
+                last_exit=%s, halted=%s
+            WHERE id=1
+        """, (
+            cash, entries,
+            json.dumps(position) if position else None,
+            last_exit, halted
+        ))
 
 def main():
-    global last_5m, last_hour, halted
+    initialize()
+    state = load_state()
+    cash = float(state["cash"])
+    entries = int(state["entries"])
+    position = state["position"]
+    last_exit = state["last_exit"]
+    halted = bool(state["halted"])
+    test_end = state["test_end"]
 
-    log("BOT_STARTED", {
-        "capital_eur": START_CAPITAL,
-        "mode": "PAPER ONLY",
-        "test_end_utc": end_time.isoformat()
-    })
+    if datetime.now(timezone.utc) >= test_end:
+        log("TEST_EXPIRED", {"message": "24h-Testzeit abgelaufen"})
+        return
 
-    # Beim Start keine rückwirkenden Trades ausführen.
-    initial_5m = candles(5)
-    initial_hour = candles(60)
-    if len(initial_5m) < 2 or len(initial_hour) < 100:
-        raise RuntimeError("Nicht genügend abgeschlossene Kursdaten")
-    last_5m = initial_5m[-1]["time"]
-    last_hour = initial_hour[-1]["time"]
+    log("WORKER_STARTED", {"cash": cash, "entries": entries})
 
-    while datetime.now(timezone.utc) < end_time:
+    last5 = None
+    lasth = None
+
+    while datetime.now(timezone.utc) < test_end:
         try:
             five = candles(5)
             hours = candles(60)
-
             if len(five) < 2 or len(hours) < 100:
-                raise RuntimeError("Zu wenige abgeschlossene Kerzen")
+                raise RuntimeError("Nicht genügend Kerzendaten")
 
-            now = time.time()
-            if now - five[-1]["time"] - 300 > 900:
-                raise RuntimeError("5-Minuten-Daten veraltet")
-            if now - hours[-1]["time"] - 3600 > 7200:
+            if time.time() - (five[-1]["time"] + 300) > 900:
+                raise RuntimeError("5m-Daten veraltet")
+            if time.time() - (hours[-1]["time"] + 3600) > 7200:
                 raise RuntimeError("Stundendaten veraltet")
 
-            signal = get_signal(hours)
+            sig = signal(hours)
 
-            if hours[-1]["time"] != last_hour:
-                if hours[-1]["time"] - last_hour != 3600:
-                    raise RuntimeError("Lücke in den Stundenkerzen")
-                last_hour = hours[-1]["time"]
-                log("NEW_HOURLY_SIGNAL", signal)
+            if lasth is not None and hours[-1]["time"] - lasth != 3600:
+                raise RuntimeError("Lücke in Stundenkerzen")
+            lasth = hours[-1]["time"]
 
-            new_candles = [c for c in five if c["time"] > last_5m]
-            for candle in new_candles:
-                if candle["time"] - last_5m != 300:
-                    raise RuntimeError("Lücke in den 5-Minuten-Kerzen")
-                process_candle(candle, signal)
-                last_5m = candle["time"]
+            new = [c for c in five if last5 is not None and c["time"] > last5]
+            if last5 is None:
+                last5 = five[-1]["time"]
+            else:
+                for c in new:
+                    if c["time"] - last5 != 300:
+                        raise RuntimeError("Lücke in 5m-Kerzen")
+                    stamp = datetime.fromtimestamp(c["time"], timezone.utc)
 
-                eq = equity_value(candle["close"])
-                db.execute(
-                    "INSERT INTO equity(time,cash,equity,pnl,signal) VALUES(?,?,?,?,?)",
-                    (datetime.now(timezone.utc).isoformat(),
-                     cash, eq, eq - START_CAPITAL, signal)
-                )
-                db.commit()
+                    if position:
+                        side = position["side"]
+                        entry = float(position["entry"])
+                        if side == "LONG":
+                            stop = entry * (1 - STOP)
+                            target = entry * (1 + TARGET)
+                            stop_hit = c["low"] <= stop
+                            target_hit = c["high"] >= target
+                        else:
+                            stop = entry * (1 + STOP)
+                            target = entry * (1 - TARGET)
+                            stop_hit = c["high"] >= stop
+                            target_hit = c["low"] <= target
 
-                if eq <= START_CAPITAL - 3 and position:
-                    halted = True
-                    close_position(candle["open"], "RISK_STOP", 
-                                   datetime.fromtimestamp(candle["time"], timezone.utc).isoformat())
+                        exit_reason = None
+                        exit_price = None
+                        if stop_hit:
+                            exit_reason, exit_price = "STOP_LOSS", stop
+                        elif target_hit:
+                            exit_reason, exit_price = "TAKE_PROFIT", target
+                        elif sig != side:
+                            exit_reason, exit_price = "SIGNAL_CHANGE", c["open"]
+
+                        if exit_reason:
+                            fill = exit_price * (
+                                1 - SLIP if side == "LONG" else 1 + SLIP
+                            )
+                            qty = float(position["qty"])
+                            gross = (
+                                (fill - entry) * qty if side == "LONG"
+                                else (entry - fill) * qty
+                            )
+                            exit_fee = fill * qty * FEE
+                            entry_fee = float(position["entry_fee"])
+                            pnl = gross - exit_fee - entry_fee
+                            cash += gross - exit_fee
+
+                            with connect() as db:
+                                db.execute("""
+                                    INSERT INTO trades
+                                    (side,entry_time,exit_time,entry_price,
+                                    exit_price,quantity,pnl,costs,reason)
+                                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                """, (
+                                    side, position["time"], stamp, entry,
+                                    fill, qty, pnl,
+                                    entry_fee + exit_fee, exit_reason
+                                ))
+                            position = None
+                            last_exit = stamp
+
+                    if position is None and not halted:
+                        if cash <= 0:
+                            halted = True
+                        elif cash <= START_CAPITAL - 3:
+                            halted = True
+                        elif last_exit is None or stamp - last_exit >= timedelta(minutes=COOLDOWN):
+                            if sig in ("LONG", "SHORT") and entries < MAX_ENTRIES:
+                                notional = min(MAX_ENTRY, cash)
+                                fill = c["open"] * (
+                                    1 + SLIP if sig == "LONG" else 1 - SLIP
+                                )
+                                qty = notional / fill
+                                fee = notional * FEE
+                                cash -= fee
+                                position = {
+                                    "side": sig, "entry": fill,
+                                    "qty": qty, "entry_fee": fee,
+                                    "time": stamp.isoformat()
+                                }
+                                entries += 1
+                                log("POSITION_OPENED", {
+                                    "side": sig, "price": fill,
+                                    "quantity": qty
+                                })
+
+                    mark = c["close"]
+                    eq = cash
+                    if position:
+                        side = position["side"]
+                        entry = float(position["entry"])
+                        qty = float(position["qty"])
+                        hypothetical = mark * (
+                            1 - SLIP if side == "LONG" else 1 + SLIP
+                        )
+                        gross = (
+                            (hypothetical - entry) * qty if side == "LONG"
+                            else (entry - hypothetical) * qty
+                        )
+                        eq += gross - hypothetical * qty * FEE
+
+                    with connect() as db:
+                        db.execute("""
+                            INSERT INTO equity(cash,equity,pnl,signal)
+                            VALUES(%s,%s,%s,%s)
+                        """, (cash, eq, eq - START_CAPITAL, sig))
+
+                    save_state(cash, entries, position, last_exit, halted)
+                    last5 = c["time"]
 
             time.sleep(60)
 
         except Exception as exc:
-            log("DATA_OR_RUNTIME_ERROR", repr(exc))
+            log("DATA_OR_RUNTIME_ERROR", {"error": str(exc)})
             time.sleep(60)
 
-    # Ende des 24-Stunden-Tests: offene Position schließen.
-    final_candles = candles(5)
-    if position and final_candles:
-        close_position(final_candles[-1]["close"], "TEST_END",
-                       datetime.now(timezone.utc).isoformat())
-
-    log("TEST_FINISHED", {
-        "final_cash_eur": round(cash, 4),
-        "total_pnl_eur": round(cash - START_CAPITAL, 4),
-        "entries": entries
-    })
-
+    log("TEST_FINISHED", {"cash": cash, "entries": entries})
 
 if __name__ == "__main__":
     main()
