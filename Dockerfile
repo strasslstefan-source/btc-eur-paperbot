@@ -1,4 +1,5 @@
 
+
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -10,4 +11,4 @@ COPY . .
 
 EXPOSE 8501
 
-CMD ["streamlit", "run", "dashboard.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
+CMD ["sh", "-c", "python bot.py & streamlit run dashboard.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true"]
