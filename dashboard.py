@@ -1,9 +1,7 @@
 
-import sqlite3
-from pathlib import Path
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+from database import initialize, connect
 
 st.set_page_config(
     page_title="BTC/EUR Paper Trading",
@@ -11,55 +9,57 @@ st.set_page_config(
     layout="wide"
 )
 
-DB = Path("paperbot.sqlite3")
-
 st.title("₿ BTC/EUR Paper Trading")
-st.caption("Virtuelles Trading – keine echten Orders")
-
-if not DB.exists():
-    st.warning("Noch keine Bot-Daten vorhanden. Der Bot wurde möglicherweise noch nicht gestartet.")
-    st.stop()
-
-con = sqlite3.connect(DB)
+st.caption("Paper Trading – keine echten Orders")
 
 try:
-    equity = pd.read_sql_query(
-        "SELECT * FROM equity ORDER BY time DESC LIMIT 1",
-        con
-    )
-    events = pd.read_sql_query(
-        "SELECT * FROM events ORDER BY id DESC LIMIT 20",
-        con
-    )
-    trades = pd.read_sql_query(
-        "SELECT * FROM trades ORDER BY id DESC LIMIT 20",
-        con
-    )
+    initialize()
 
+    with connect() as conn:
+        state = conn.execute(
+            "SELECT * FROM bot_state WHERE id = 1"
+        ).fetchone()
+
+        equity = pd.read_sql_query(
+            "SELECT time, cash, equity, pnl, signal "
+            "FROM equity ORDER BY time DESC LIMIT 100",
+            conn
+        )
+
+        trades = pd.read_sql_query(
+            "SELECT side, entry_time, exit_time, entry_price, "
+            "exit_price, quantity, pnl, costs, reason "
+            "FROM trades ORDER BY id DESC LIMIT 50",
+            conn
+        )
+
+        events = pd.read_sql_query(
+            "SELECT time, event, details "
+            "FROM events ORDER BY id DESC LIMIT 20",
+            conn
+        )
+
+    if state is None:
+        st.warning("Bot wurde noch nicht initialisiert.")
+    else:
+        st.metric("Virtuelles Bargeld", f"{state['cash']:.4f} €")
+        st.metric("Anzahl Einstiege", state["entries"])
+        st.write("Bot angehalten:", state["halted"])
+        st.write("Offene Position:", state["position"])
+
+    st.subheader("Eigenkapital-Verlauf")
     if not equity.empty:
-        latest = equity.iloc[0]
-        st.subheader("Kontostand")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Virtuelles Eigenkapital", f"{latest['equity']:.4f} €")
-        c2.metric("Bargeld", f"{latest['cash']:.4f} €")
-        c3.metric("Gewinn / Verlust", f"{latest['pnl']:+.4f} €")
-        st.write("Letztes Signal:", latest["signal"])
-    else:
-        st.info("Noch keine abgeschlossenen Ausführungsintervalle.")
+        st.line_chart(equity.set_index("time")["equity"])
+        st.dataframe(equity, use_container_width=True)
 
-    st.subheader("Letzte Trades")
-    if trades.empty:
-        st.info("Noch keine abgeschlossenen Trades.")
-    else:
-        st.dataframe(trades, use_container_width=True)
+    st.subheader("Trade-Historie")
+    st.dataframe(trades, use_container_width=True)
 
-    st.subheader("Bot-Ereignisse")
-    if events.empty:
-        st.info("Noch keine Ereignisse.")
-    else:
-        st.dataframe(events, use_container_width=True)
+    st.subheader("Letzte Bot-Ereignisse")
+    st.dataframe(events, use_container_width=True)
 
-finally:
-    con.close()
+    if st.button("Ansicht aktualisieren"):
+        st.rerun()
 
-st.caption("Aktualisiere die Seite im Browser, um neue Daten zu laden.")
+except Exception as exc:
+    st.error(f"Datenbank oder Bot noch nicht bereit: {exc}")
